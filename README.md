@@ -43,4 +43,6 @@ FILE_SHARE_PASSWORD="你的口令" python network_file_server.py
 python network_file_server.py --port 9000 --dir /path/to/share --max-upload-mb 4096
 ```
 
+默认单次上传请求的总大小上限为 20 GB；一次选择多个文件时，所有文件合计不能超过该上限。
+
 注意：程序默认监听所有网卡，同一网络中的设备都可能访问。请勿在共享目录放置敏感文件；公网使用时应增加 HTTPS 和更完善的身份认证。

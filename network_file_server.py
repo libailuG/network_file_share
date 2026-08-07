@@ -215,7 +215,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="0.0.0.0", help="监听地址")
     parser.add_argument("--port", type=int, default=8000, help="监听端口")
     parser.add_argument("--password", default=os.environ.get("FILE_SHARE_PASSWORD"), help="可选访问口令")
-    parser.add_argument("--max-upload-mb", type=int, default=2048, help="单次请求上传大小上限")
+    parser.add_argument("--max-upload-mb", type=int, default=20480, help="单次请求上传大小上限")
     return parser.parse_args()
 
 
