@@ -1,0 +1,3 @@
+__pycache__/
+network_file/*
+!network_file/.gitkeep
