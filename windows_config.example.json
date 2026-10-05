@@ -2,5 +2,6 @@
   "host": "0.0.0.0",
   "port": 8000,
   "password": "",
-  "max_upload_mb": 20480
+  "max_upload_mb": 20480,
+  "auto_start": true
 }

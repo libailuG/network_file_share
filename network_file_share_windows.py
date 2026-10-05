@@ -5,17 +5,20 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import socket
+import subprocess
 import sys
 import threading
 import tempfile
 import urllib.request
 from logging.handlers import RotatingFileHandler
+from contextlib import ExitStack
 from pathlib import Path
 from PyQt6.QtCore import QEvent, QLockFile, Qt, QTimer, QUrl
 from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
-    QApplication, QFrame, QGridLayout, QLabel, QMainWindow,
+    QApplication, QCheckBox, QFrame, QGridLayout, QLabel, QMainWindow,
     QMenu, QMessageBox, QPushButton, QStyle, QSystemTrayIcon, QVBoxLayout, QWidget,
 )
 
@@ -29,7 +32,71 @@ DEFAULT_CONFIG = {
     "port": 8000,
     "password": "",
     "max_upload_mb": 20480,
+    "auto_start": True,
 }
+
+AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+AUTOSTART_VALUE = "LANFileShare"
+
+
+def startup_command() -> str:
+    if getattr(sys, "frozen", False):
+        arguments = [str(Path(sys.executable).resolve()), "--autostart"]
+    else:
+        interpreter = Path(sys.executable).resolve()
+        windowed = interpreter.with_name("pythonw.exe")
+        if windowed.exists():
+            interpreter = windowed
+        arguments = [str(interpreter), str(Path(__file__).resolve()), "--autostart"]
+    command = subprocess.list2cmdline(arguments)
+    if len(command) > 260:
+        raise OSError("程序路径过长，请移动到较短的目录后设置开机启动")
+    return command
+
+
+def read_autostart() -> str | None:
+    if sys.platform != "win32":
+        return None
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_KEY) as key:
+            value, _kind = winreg.QueryValueEx(key, AUTOSTART_VALUE)
+            return value
+    except FileNotFoundError:
+        return None
+
+
+def set_autostart(enabled: bool) -> None:
+    if sys.platform != "win32":
+        raise OSError("开机启动仅支持 Windows")
+    import winreg
+    desired = startup_command() if enabled else None
+    if read_autostart() == desired:
+        return
+    with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, AUTOSTART_KEY, access=winreg.KEY_SET_VALUE) as key:
+        if enabled:
+            winreg.SetValueEx(key, AUTOSTART_VALUE, 0, winreg.REG_SZ, desired)
+        else:
+            try:
+                winreg.DeleteValue(key, AUTOSTART_VALUE)
+            except FileNotFoundError:
+                pass
+
+
+def save_config(base_dir: Path, config: dict) -> None:
+    path = base_dir / "config.json"
+    current = json.loads(path.read_text(encoding="utf-8-sig")) if path.exists() else {}
+    current.update(config)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=base_dir, delete=False) as output:
+            temporary = Path(output.name)
+            json.dump(current, output, ensure_ascii=False, indent=2)
+            output.write("\n")
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def application_dir() -> Path:
@@ -52,6 +119,8 @@ def load_config(base_dir: Path) -> dict:
     config["port"] = int(config["port"])
     config["password"] = str(config["password"] or "")
     config["max_upload_mb"] = int(config["max_upload_mb"])
+    if not isinstance(config["auto_start"], bool):
+        raise ValueError("auto_start 必须是 true 或 false")
     if not 1 <= config["port"] <= 65535:
         raise ValueError("port 必须在 1～65535 之间")
     if config["max_upload_mb"] < 1:
@@ -109,8 +178,8 @@ class WindowsLauncher(QMainWindow):
 
     def _build_window(self) -> None:
         self.setWindowTitle("局域网文件共享 · Qt")
-        self.resize(720, 460)
-        self.setMinimumSize(620, 420)
+        self.resize(720, 560)
+        self.setMinimumSize(620, 540)
         self.setStyleSheet("""
             QMainWindow { background: #f4f7fb; }
             QWidget { font-family: 'Microsoft YaHei UI'; font-size: 13px; color: #172b4d; }
@@ -136,8 +205,15 @@ class WindowsLauncher(QMainWindow):
         layout.addWidget(subtitle)
         self.status_label = QLabel("● 服务未启动")
         layout.addWidget(self.status_label)
+        self.startup_checkbox = QCheckBox("开机启动（登录 Windows 后自动运行）")
+        self.startup_checkbox.setChecked(self.config["auto_start"])
+        self.startup_checkbox.setEnabled(sys.platform == "win32")
+        self.startup_checkbox.setToolTip("默认开启；开机启动时直接进入托盘，不弹出浏览器。取消勾选立即生效。")
+        self.startup_checkbox.toggled.connect(self.change_autostart)
+        layout.addWidget(self.startup_checkbox)
         card = QFrame()
         card.setObjectName("card")
+        card.setMinimumHeight(210)
         details = QGridLayout(card)
         details.setContentsMargins(18, 18, 18, 18)
         details.setVerticalSpacing(14)
@@ -230,6 +306,38 @@ class WindowsLauncher(QMainWindow):
         self.local_label.setText(self.local_url)
         self.lan_label.setText(self.lan_url)
 
+    def change_autostart(self, enabled: bool) -> None:
+        previous = self.config["auto_start"]
+        updated = {**self.config, "auto_start": enabled}
+        saved = False
+        try:
+            save_config(self.base_dir, updated)
+            saved = True
+            set_autostart(enabled)
+        except (OSError, ValueError) as error:
+            if saved:
+                try:
+                    save_config(self.base_dir, self.config)
+                except OSError:
+                    logging.getLogger("werkzeug").exception("Failed to restore startup preference")
+            self.startup_checkbox.blockSignals(True)
+            self.startup_checkbox.setChecked(previous)
+            self.startup_checkbox.blockSignals(False)
+            QMessageBox.warning(self, "设置未生效", f"无法更改开机启动：\n{error}")
+            return
+        self.config.update(updated)
+        self.statusBar().showMessage("已开启开机启动" if enabled else "已关闭开机启动", 5000)
+
+    def sync_autostart(self) -> None:
+        if sys.platform != "win32":
+            return
+        try:
+            set_autostart(self.config["auto_start"])
+        except OSError as error:
+            logging.getLogger("werkzeug").warning("Could not register startup: %s", error)
+            self.statusBar().showMessage(f"开机启动未生效：{error}")
+            self.tray.showMessage("开机启动未生效", str(error), QSystemTrayIcon.MessageIcon.Warning)
+
     @staticmethod
     def open_url(url: str) -> None:
         QDesktopServices.openUrl(QUrl(url))
@@ -282,11 +390,17 @@ def self_test(application: QApplication, report_path: Path) -> int:
     """Exercise the frozen application without touching the user's files."""
     report = {"ok": False}
     launcher = None
+    global AUTOSTART_KEY
+    original_startup_key = AUTOSTART_KEY
+    test_startup_key = None
     try:
-        with tempfile.TemporaryDirectory() as directory:
+        with ExitStack() as cleanup:
+            directory = cleanup.enter_context(tempfile.TemporaryDirectory())
             config = {**DEFAULT_CONFIG, "host": "127.0.0.1", "port": 0}
             launcher = WindowsLauncher(Path(directory), config)
+            cleanup.callback(launcher.stop)
             launcher.start()
+            config["port"] = launcher.server.server_port
             launcher.show()
             application.processEvents()
             with urllib.request.urlopen(launcher.local_url, timeout=10) as response:
@@ -300,6 +414,21 @@ def self_test(application: QApplication, report_path: Path) -> int:
                 assert json.load(response)["messages"] == []
             launcher.copy_address()
             assert application.clipboard().text() == launcher.lan_url
+            assert launcher.startup_checkbox.isChecked()
+            if sys.platform == "win32":
+                # Exercise real registry I/O in an isolated key, never in Run.
+                test_startup_key = "Software\\LANFileShareTests\\" + Path(directory).name
+                AUTOSTART_KEY = test_startup_key
+                launcher.startup_checkbox.setChecked(False)
+                assert read_autostart() is None
+                assert load_config(Path(directory))["auto_start"] is False
+                launcher.startup_checkbox.setChecked(True)
+                assert read_autostart() == startup_command()
+                assert load_config(Path(directory))["auto_start"] is True
+                launcher.startup_checkbox.setChecked(False)
+                assert read_autostart() is None
+                assert load_config(Path(directory))["auto_start"] is False
+                AUTOSTART_KEY = original_startup_key
             tray_available = QSystemTrayIcon.isSystemTrayAvailable()
             if tray_available:
                 launcher.showMinimized()
@@ -323,13 +452,24 @@ def self_test(application: QApplication, report_path: Path) -> int:
                            "checks": ["window", "upload", "download", "chat", "clipboard", "shutdown"]})
             if tray_available:
                 report["checks"].extend(["minimize_to_tray", "tray_hide", "background_http", "restore", "close_to_tray"])
+            if sys.platform == "win32":
+                report["checks"].extend(["autostart_default", "autostart_enable", "autostart_disable", "autostart_persistence"])
             server_thread = launcher.thread
             launcher.exit_application()
             assert not server_thread.is_alive()
     except Exception as error:
-        report = {"ok": False, "error": repr(error)}
+        import traceback
+        report = {"ok": False, "error": repr(error), "traceback": traceback.format_exc()}
         if launcher is not None:
             launcher.stop()
+    finally:
+        AUTOSTART_KEY = original_startup_key
+        if test_startup_key is not None:
+            import winreg
+            try:
+                winreg.DeleteKey(winreg.HKEY_CURRENT_USER, test_startup_key)
+            except FileNotFoundError:
+                pass
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     return 0 if report["ok"] else 1
 
@@ -349,18 +489,22 @@ def main() -> int:
             QMessageBox.information(None, "程序已运行", "共享程序已经启动，请使用现有窗口。")
             return 0
         config = load_config(base_dir)
-        if not (base_dir / "config.json").exists():
-            (base_dir / "config.json").write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        save_config(base_dir, config)
         launcher = WindowsLauncher(base_dir, config)
         launcher.start()
+        launcher.sync_autostart()
     except Exception as error:
         if launcher is not None:
             launcher.stop()
         QMessageBox.critical(None, "启动失败", f"无法启动服务：\n{error}")
         return 1
     application.aboutToQuit.connect(launcher.stop)
-    launcher.show()
-    QTimer.singleShot(600, lambda: launcher.open_url(launcher.local_url))
+    if "--autostart" in sys.argv and QSystemTrayIcon.isSystemTrayAvailable():
+        launcher.hide()
+    else:
+        launcher.show()
+    if "--autostart" not in sys.argv:
+        QTimer.singleShot(600, lambda: launcher.open_url(launcher.local_url))
     return application.exec()
 
 

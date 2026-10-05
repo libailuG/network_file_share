@@ -1,11 +1,15 @@
 """Build from the active Python environment without unrelated PATH DLLs."""
 import os
+import argparse
 import subprocess
 import sys
 from pathlib import Path
 import PyQt6
 
 base = Path(__file__).resolve().parent
+parser = argparse.ArgumentParser()
+parser.add_argument('--output-dir', type=Path, default=base)
+options = parser.parse_args()
 prefix = Path(sys.prefix)
 qt_bin = Path(PyQt6.__path__[0]) / 'Qt6' / 'bin'
 system_root = Path(os.environ.get('SystemRoot', 'C:/Windows'))
@@ -20,7 +24,7 @@ for name in ('QT_PLUGIN_PATH', 'QT_QPA_PLATFORM_PLUGIN_PATH', 'PYTHONPATH', 'QT_
 subprocess.run([
     sys.executable, '-m', 'PyInstaller', '--noconfirm', '--clean',
     '--onefile', '--windowed', '--noupx', '--name', 'LAN_File_Share',
-    '--distpath', str(base), '--workpath', str(base / 'work' / 'pyinstaller'),
+    '--distpath', str(options.output_dir), '--workpath', str(base / 'work' / 'pyinstaller'),
     '--specpath', str(base / 'work'),
     '--exclude-module', 'tkinter', '--exclude-module', 'PyQt5',
     '--exclude-module', 'PySide2', '--exclude-module', 'PySide6',

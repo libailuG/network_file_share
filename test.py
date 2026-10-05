@@ -6,7 +6,7 @@ import zipfile
 from pathlib import Path
 
 from network_file_server import create_app, safe_name
-from network_file_share_windows import load_config
+from network_file_share_windows import load_config, save_config
 
 
 class FileShareChatTests(unittest.TestCase):
@@ -142,6 +142,27 @@ class FileShareChatTests(unittest.TestCase):
 
 
 class WindowsLauncherTests(unittest.TestCase):
+    def test_autostart_defaults_enabled_and_remembers_disabled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            self.assertIs(load_config(base)['auto_start'], True)
+            (base / 'config.json').write_text('{"port": 9000, "password": "existing", "custom": "keep"}', encoding='utf-8')
+            config = load_config(base)
+            config['auto_start'] = False
+            save_config(base, config)
+            restarted = load_config(base)
+            self.assertIs(restarted['auto_start'], False)
+            self.assertEqual(restarted['password'], 'existing')
+            self.assertEqual(restarted['port'], 9000)
+            self.assertEqual(json.loads((base / 'config.json').read_text(encoding='utf-8'))['custom'], 'keep')
+
+    def test_autostart_rejects_non_boolean_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            (base / 'config.json').write_text('{"auto_start": "false"}', encoding='utf-8')
+            with self.assertRaises(ValueError):
+                load_config(base)
+
     def test_windows_config_defaults_and_overrides(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
