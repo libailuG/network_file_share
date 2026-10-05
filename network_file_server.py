@@ -273,8 +273,9 @@ CHAT_PAGE = r"""<!doctype html>
       body.className = 'body';
       body.textContent = item.message;
       row.append(timestamp, body);
-      messages.append(row);
-      latestId = Math.max(latestId, Number(item.id) || 0);
+      const nextRow = Array.from(messages.querySelectorAll('[data-id]'))
+        .find(existing => Number(existing.dataset.id) > Number(item.id));
+      messages.insertBefore(row, nextRow || null);
     }
 
     async function loadMessages() {
@@ -286,7 +287,10 @@ CHAT_PAGE = r"""<!doctype html>
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const data = await response.json();
         document.getElementById('online-count').textContent = data.online_count;
-        for (const item of data.messages) addMessage(item);
+        for (const item of data.messages) {
+          addMessage(item);
+          latestId = Math.max(latestId, Number(item.id) || 0);
+        }
         if (shouldStick && data.messages.length) messages.scrollTop = messages.scrollHeight;
         status.textContent = '';
         status.className = 'muted';
@@ -355,6 +359,14 @@ def safe_name(raw_name: str) -> str:
     """Keep Unicode names while removing any client-supplied directory portion."""
     name = raw_name.replace("\\", "/").rsplit("/", 1)[-1].strip()
     if name in {"", ".", ".."} or "\x00" in name or any(ord(ch) < 32 for ch in name):
+        return ""
+    # Keep names portable and reject Windows drive paths, ADS and device names.
+    if any(ch in name for ch in '<>:"|?*') or name.endswith((".", " ")):
+        return ""
+    device = name.split(".", 1)[0].upper()
+    if device in {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"} or (
+        len(device) == 4 and device[:3] in {"COM", "LPT"} and device[3] in "123456789¹²³"
+    ):
         return ""
     return name
 
@@ -464,6 +476,7 @@ def create_app(root: Path, password: str | None, max_upload_mb: int, log_dir: Pa
     chat_rate_lock = threading.Lock()
     chat_presence: dict[str, float] = {}
     chat_presence_lock = threading.Lock()
+    upload_commit_lock = threading.Lock()
 
     def anonymous_identity() -> str:
         client_id = session.get("chat_client_id")
@@ -488,6 +501,33 @@ def create_app(root: Path, password: str | None, max_upload_mb: int, log_dir: Pa
         except ValueError:
             abort(403)
         return candidate
+
+    def save_upload(target: Path, source, expected_length: int | None = None) -> None:
+        """Stage data, then commit without overwriting an existing file."""
+        if target.exists():
+            abort(409, description="同名文件或文件夹已存在，请重命名后上传")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(f".{target.name}.{secrets.token_hex(8)}.uploading")
+        written = 0
+        try:
+            with temporary.open("xb", buffering=4 * 1024 * 1024) as output:
+                while chunk := source.read(4 * 1024 * 1024):
+                    output.write(chunk)
+                    written += len(chunk)
+            if expected_length is not None and written != expected_length:
+                abort(400, description="上传数据不完整")
+            with upload_commit_lock:
+                # A second request may have committed while this body was read.
+                safe_path(target.relative_to(root).as_posix())
+                if target.exists():
+                    abort(409, description="同名文件或文件夹已存在，请重命名后上传")
+                # Hard-link creation fails if a local writer also created the name.
+                try:
+                    os.link(temporary, target)
+                except FileExistsError:
+                    abort(409, description="同名文件或文件夹已存在，请重命名后上传")
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def directory_zip_chunks(directory: Path):
         """Build a ZIP archive incrementally without a temporary archive file."""
@@ -545,7 +585,10 @@ def create_app(root: Path, password: str | None, max_upload_mb: int, log_dir: Pa
     def login():
         error = False
         if request.method == "POST":
-            if secrets.compare_digest(request.form.get("password", ""), password or ""):
+            if secrets.compare_digest(
+                request.form.get("password", "").encode("utf-8"),
+                (password or "").encode("utf-8"),
+            ):
                 session["authorized"] = True
                 target = request.args.get("next", "/")
                 if not target.startswith("/") or target.startswith("//"):
@@ -647,22 +690,7 @@ def create_app(root: Path, password: str | None, max_upload_mb: int, log_dir: Pa
             return Response("文件路径无效", status=400, content_type="text/plain; charset=utf-8")
 
         target = safe_path((Path(subpath) / relative).as_posix())
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if target.is_dir():
-            return Response("目标路径是一个文件夹", status=409, content_type="text/plain; charset=utf-8")
-
-        temporary = target.with_name(f".{target.name}.{secrets.token_hex(8)}.uploading")
-        written = 0
-        try:
-            with temporary.open("xb", buffering=4 * 1024 * 1024) as output:
-                while chunk := request.stream.read(4 * 1024 * 1024):
-                    output.write(chunk)
-                    written += len(chunk)
-            if request.content_length is not None and written != request.content_length:
-                return Response("上传数据不完整", status=400, content_type="text/plain; charset=utf-8")
-            os.replace(temporary, target)
-        finally:
-            temporary.unlink(missing_ok=True)
+        save_upload(target, request.stream, request.content_length)
 
         return Response('{"ok":true}', content_type="application/json")
 
@@ -683,8 +711,7 @@ def create_app(root: Path, password: str | None, max_upload_mb: int, log_dir: Pa
             if relative is None:
                 continue
             target = safe_path((Path(subpath) / relative).as_posix())
-            target.parent.mkdir(parents=True, exist_ok=True)
-            uploaded.save(target)
+            save_upload(target, uploaded.stream)
             saved += 1
         return redirect(url_for("browse", subpath=subpath, message=f"已上传 {saved} 个文件"))
 
@@ -696,7 +723,7 @@ def create_app(root: Path, password: str | None, max_upload_mb: int, log_dir: Pa
         if not name:
             return redirect(url_for("browse", subpath=subpath, message="文件夹名称无效", error="1"))
         try:
-            (destination / name).mkdir()
+            safe_path((Path(subpath) / name).as_posix()).mkdir()
             message, error = f"已创建文件夹：{name}", None
         except FileExistsError:
             message, error = "同名文件或文件夹已存在", "1"
@@ -733,12 +760,16 @@ def create_app(root: Path, password: str | None, max_upload_mb: int, log_dir: Pa
     def too_large(_error):
         return Response(f"上传内容超过 {max_upload_mb} MB 限制", status=413, content_type="text/plain; charset=utf-8")
 
+    @app.errorhandler(409)
+    def conflict(error):
+        return Response(error.description, status=409, content_type="text/plain; charset=utf-8")
+
     return app
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="在局域网中共享文件并进行匿名聊天")
-    parser.add_argument("--dir", type=Path, default=Path(__file__).parent / "network_file", help="共享目录")
+    parser.add_argument("--dir", type=Path, default=Path(__file__).parent / "data", help="共享目录")
     parser.add_argument("--logs-dir", type=Path, default=Path(__file__).parent / "logs", help="聊天记录目录")
     parser.add_argument("--host", default="0.0.0.0", help="监听地址")
     parser.add_argument("--port", type=int, default=8000, help="监听端口")

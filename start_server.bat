@@ -2,9 +2,7 @@
 setlocal
 chcp 65001 >nul
 cd /d "%~dp0"
-python -m pip install -r requirements.txt "pyinstaller>=6,<7"
-if errorlevel 1 goto :failed
-python build_exe.py
+python network_file_server.py --dir "%~dp0data" --logs-dir "%~dp0logs"
 if errorlevel 1 goto :failed
 exit /b 0
 :failed
