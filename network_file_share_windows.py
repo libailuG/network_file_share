@@ -10,12 +10,13 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 import tempfile
 import urllib.request
 from logging.handlers import RotatingFileHandler
 from contextlib import ExitStack
 from pathlib import Path
-from PyQt6.QtCore import QEvent, QLockFile, Qt, QTimer, QUrl
+from PyQt6.QtCore import QEvent, QLockFile, QThread, Qt, QTimer, QUrl, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QFrame, QGridLayout, QLabel, QMainWindow,
@@ -132,6 +133,7 @@ def local_ip() -> str:
     """Find the preferred LAN address without sending application data."""
     probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
+        probe.settimeout(0.5)
         probe.connect(("8.8.8.8", 80))
         return str(probe.getsockname()[0])
     except OSError:
@@ -157,6 +159,17 @@ def configure_logging(log_dir: Path) -> RotatingFileHandler:
     return handler
 
 
+class AddressProbe(QThread):
+    address_found = pyqtSignal(str)
+
+    def run(self) -> None:
+        try:
+            address = local_ip()
+        except OSError:
+            address = ""
+        self.address_found.emit(address)
+
+
 class WindowsLauncher(QMainWindow):
     def __init__(self, base_dir: Path, config: dict):
         super().__init__()
@@ -171,10 +184,15 @@ class WindowsLauncher(QMainWindow):
         self.thread = None
         self._exit_requested = False
         self._tray_notice_shown = False
+        self._address_probe = None
+        self._manual_address_refresh = False
         self.local_url = f"http://127.0.0.1:{config['port']}"
         self.lan_url = f"http://{local_ip()}:{config['port']}"
         self._build_window()
         self._build_tray()
+        self.address_timer = QTimer(self)
+        self.address_timer.setInterval(10000)
+        self.address_timer.timeout.connect(self.check_address)
 
     def _build_window(self) -> None:
         self.setWindowTitle("局域网文件共享 · Qt")
@@ -228,7 +246,11 @@ class WindowsLauncher(QMainWindow):
             details.addWidget(QLabel(label), row, 0)
             value.setWordWrap(True)
             value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-            details.addWidget(value, row, 1)
+            details.addWidget(value, row, 1, 1, 1 if row == 1 else 2)
+        self.refresh_address_button = QPushButton("刷新地址")
+        self.refresh_address_button.setToolTip("立即检测当前局域网地址；程序也会每 10 秒自动检查。")
+        self.refresh_address_button.clicked.connect(self.refresh_address)
+        details.addWidget(self.refresh_address_button, 1, 2)
         details.setColumnStretch(1, 1)
         self._update_addresses()
         layout.addWidget(card)
@@ -262,6 +284,7 @@ class WindowsLauncher(QMainWindow):
             ("打开匿名聊天", lambda: self.open_url(self.local_url + "/chat")),
             ("打开共享文件夹", lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.share_dir)))),
             ("复制局域网地址", self.copy_address),
+            ("刷新局域网地址", self.refresh_address),
         ):
             self.tray_menu.addAction(text).triggered.connect(callback)
         self.tray_menu.addSeparator()
@@ -305,6 +328,48 @@ class WindowsLauncher(QMainWindow):
     def _update_addresses(self) -> None:
         self.local_label.setText(self.local_url)
         self.lan_label.setText(self.lan_url)
+
+    def refresh_address(self) -> None:
+        if self.server is None:
+            return
+        self._manual_address_refresh = True
+        self.refresh_address_button.setEnabled(False)
+        self.statusBar().showMessage("正在检测局域网地址…")
+        self.check_address()
+
+    def check_address(self) -> None:
+        if self.server is None or self._address_probe is not None:
+            return
+        self._address_probe = AddressProbe(self)
+        self._address_probe.address_found.connect(self._apply_address)
+        self._address_probe.finished.connect(self._finish_address_probe)
+        self._address_probe.start()
+
+    @pyqtSlot(str)
+    def _apply_address(self, address: str) -> None:
+        if self.server is None:
+            return
+        if not address:
+            if self._manual_address_refresh:
+                self.statusBar().showMessage("检测失败，请稍后重试", 5000)
+            return
+        updated = f"http://{address}:{self.server.server_port}"
+        changed = updated != self.lan_url
+        if changed:
+            self.lan_url = updated
+            self._update_addresses()
+            self.tray.setToolTip(f"文件共享正在运行\n{self.lan_url}")
+        if changed or self._manual_address_refresh:
+            self.statusBar().showMessage(f"局域网地址已更新：{updated}" if changed else "局域网地址未变化", 5000)
+
+    @pyqtSlot()
+    def _finish_address_probe(self) -> None:
+        probe = self._address_probe
+        self._address_probe = None
+        self._manual_address_refresh = False
+        self.refresh_address_button.setEnabled(True)
+        if probe is not None:
+            probe.deleteLater()
 
     def change_autostart(self, enabled: bool) -> None:
         previous = self.config["auto_start"]
@@ -360,10 +425,20 @@ class WindowsLauncher(QMainWindow):
         self.tray.setToolTip(f"文件共享正在运行\n{self.lan_url}")
         self.thread = threading.Thread(target=self.server.serve_forever, name="lan-file-share", daemon=True)
         self.thread.start()
+        self.address_timer.start()
         self.status_label.setText("● 服务正在运行")
         self.status_label.setStyleSheet("color: #16883c; font-weight: bold;")
 
     def stop(self) -> None:
+        self.address_timer.stop()
+        if self._address_probe is not None:
+            self._address_probe.address_found.disconnect(self._apply_address)
+            self._address_probe.finished.disconnect(self._finish_address_probe)
+            self._address_probe.wait()
+            self._address_probe.deleteLater()
+            self._address_probe = None
+        self._manual_address_refresh = False
+        self.refresh_address_button.setEnabled(True)
         if self.server is not None:
             if self.thread is not None and self.thread.is_alive():
                 self.server.shutdown()
@@ -414,6 +489,40 @@ def self_test(application: QApplication, report_path: Path) -> int:
                 assert json.load(response)["messages"] == []
             launcher.copy_address()
             assert application.clipboard().text() == launcher.lan_url
+            # Simulate a network change without changing the computer's network.
+            from unittest.mock import patch
+
+            def wait_for_address(expected: str) -> None:
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    application.processEvents()
+                    if launcher.lan_url == expected and launcher._address_probe is None:
+                        return
+                    QThread.msleep(10)
+                raise AssertionError(f"Address refresh timed out: {launcher.lan_url}")
+
+            server_before = launcher.server
+            port = server_before.server_port
+            with patch(__name__ + ".local_ip", return_value="192.168.77.88"):
+                launcher.refresh_address_button.click()
+                probe = launcher._address_probe
+                launcher.check_address()
+                assert launcher._address_probe is probe
+                wait_for_address(f"http://192.168.77.88:{port}")
+            assert launcher.lan_label.text() == launcher.lan_url
+            assert launcher.lan_url in launcher.tray.toolTip()
+            assert launcher.refresh_address_button.isEnabled()
+            launcher.copy_address()
+            assert application.clipboard().text() == launcher.lan_url
+            with patch(__name__ + ".local_ip", return_value="192.168.77.99"):
+                launcher.address_timer.setInterval(50)
+                wait_for_address(f"http://192.168.77.99:{port}")
+                launcher.address_timer.stop()
+            launcher.address_timer.setInterval(10000)
+            launcher.address_timer.start()
+            assert launcher.server is server_before
+            with urllib.request.urlopen(launcher.local_url, timeout=10) as response:
+                assert response.status == 200
             assert launcher.startup_checkbox.isChecked()
             if sys.platform == "win32":
                 # Exercise real registry I/O in an isolated key, never in Run.
@@ -449,7 +558,9 @@ def self_test(application: QApplication, report_path: Path) -> int:
                 assert launcher.server is not None and not launcher.isVisible()
             report.update({"ok": True, "frozen": bool(getattr(sys, "frozen", False)),
                            "tray_available": tray_available, "exe": sys.executable,
-                           "checks": ["window", "upload", "download", "chat", "clipboard", "shutdown"]})
+                           "checks": ["window", "upload", "download", "chat", "clipboard", "shutdown",
+                                      "manual_address_refresh", "automatic_address_refresh", "refresh_no_overlap",
+                                      "refresh_keeps_server", "refresh_clipboard", "refresh_tray"]})
             if tray_available:
                 report["checks"].extend(["minimize_to_tray", "tray_hide", "background_http", "restore", "close_to_tray"])
             if sys.platform == "win32":
